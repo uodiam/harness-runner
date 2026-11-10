@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>HARNESS RUNNER</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #04050a; overflow: hidden; }
+  body {
+    font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(900px 600px at 20% 10%, #101a3a 0%, transparent 60%),
+      radial-gradient(900px 600px at 85% 90%, #2a1030 0%, transparent 60%),
+      #04050a;
+  }
+  #wrap {
+    position: relative; width: min(100vw, 1060px); height: min(100vh, 700px);
+    border-radius: 18px; overflow: hidden;
+    box-shadow: 0 0 0 1px #1b2440, 0 30px 80px -20px #000, 0 0 120px -40px #22d3ee inset;
+    touch-action: none; cursor: none;
+  }
+  canvas { display: block; }
+  #tip {
+    position: absolute; left: 50%; top: 12px; transform: translateX(-50%);
+    font-size: 11px; letter-spacing: .14em; color: #33506f; user-select: none; pointer-events: none;
+    font-family: Consolas, "Cascadia Mono", monospace;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas><div id="tip">← → / A D / 鼠标 · 空格重开 · M 静音 · v2</div></div>
+<script>
+(() => {
+  "use strict";
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const FONT = 'system-ui, "Segoe UI", "Microsoft YaHei", sans-serif';
+  const MONO = 'Consolas, "Cascadia Mono", monospace';
+  const CY = '#22d3ee', MG = '#f472b6', AM = '#fbbf24', VI = '#a78bfa';
+
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    const r = cv.parentElement.getBoundingClientRect();
+    W = r.width; H = r.height;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    cv.style.width = W + 'px'; cv.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- audio ----------
+  let actx = null, muted = false;
+  function beep(freq, dur, type, vol) {
+    if (muted) return;
+    try {
+      if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type = type || 'sine';
+      o.frequency.setValueAtTime(freq, actx.currentTime);
+      o.frequency.exponentialRampToValueAtTime(Math.max(40, freq * 0.6), actx.currentTime + dur);
+      g.gain.setValueAtTime(0.0001, actx.currentTime);
+      g.gain.exponentialRampToValueAtTime(vol || 0.06, actx.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+      o.connect(g); g.connect(actx.destination);
+      o.start(); o.stop(actx.currentTime + dur + 0.02);
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---------- helpers ----------
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  function rr(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // ---------- state ----------
+  const S = { state: 'count', t: 0, countT: 3, score: 0, best: +(localStorage.getItem('hr_best') || 0), combo: 0, comboT: 0, shake: 0, speed: 1, over: 0 };
+  const player = { x: 0, y: 0, w: 42, h: 12, targetX: null, dead: false };
+  let obstacles = [], tokens = [], parts = [], stars = [], rings = [];
+  let obsT = 0, tokT = 0;
+
+  function seedStars() {
+    stars = [];
+    for (let i = 0; i < 110; i++) {
+      stars.push({ x: rand(0, W), y: rand(0, H), z: rand(0.25, 1), r: rand(0.6, 1.8) });
+    }
+  }
+  seedStars();
+
+  function reset() {
+    S.score = 0; S.combo = 0; S.comboT = 0; S.shake = 0; S.speed = 1; S.t = 0;
+    obstacles = []; tokens = []; parts = []; rings = [];
+    obsT = 0.35; tokT = 0.9;
+    player.x = W / 2; player.targetX = null; player.dead = false;
+    player.y = H - 92;
+  }
+
+  function burst(x, y, n, color, spd) {
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, Math.PI * 2), s = rand(30, spd || 260);
+      parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.25, 0.8), max: 0.8, color, size: rand(1.2, 3.4) });
+    }
+  }
+
+  function die() {
+    S.state = 'over'; S.shake = 16; player.dead = true;
+    burst(player.x, player.y, 60, CY, 420);
+    burst(player.x, player.y, 30, MG, 320);
+    beep(220, 0.5, 'sawtooth', 0.09);
+    if (S.score > S.best) { S.best = Math.floor(S.score); localStorage.setItem('hr_best', S.best); }
+  }
+
+  // ---------- input ----------
+  const keys = new Set();
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (['arrowleft', 'arrowright', 'a', 'd', ' ', 'enter'].includes(k)) e.preventDefault();
+    keys.add(k);
+    if (k === 'm') { muted = !muted; return; }
+    if (S.state !== 'play' && (k === ' ' || k === 'enter')) startGame();
+    else if (S.state === 'over') { startGame(); }
+  });
+  window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+
+  function startGame() {
+    if (S.state !== 'over') return;
+    S.state = 'count'; reset(); S.countT = 3;
+    beep(660, 0.12, 'triangle', 0.05);
+  }
+  window.addEventListener('pointerdown', (e) => {
+    const r = cv.getBoundingClientRect();
+    if (S.state === 'over' && S.over > 0.35) { startGame(); return; }
+    player.targetX = clamp(e.clientX - r.left, 20, W - 20);
+  });
+  window.addEventListener('pointermove', (e) => {
+    if (S.state !== 'play') return;
+    const r = cv.getBoundingClientRect();
+    player.targetX = clamp(e.clientX - r.left, 20, W - 20);
+  });
+
+  // ---------- update ----------
+  function update(dt) {
+    S.t += dt;
+    S.over += dt;
+
+    for (const s of stars) {
+      s.y += (40 + s.z * 150) * dt * (S.state === 'play' ? 1 + S.speed * 0.25 : 1);
+      if (s.y > H) { s.y = -4; s.x = rand(0, W); }
+    }
+
+    // particles
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i];
+      p.life -= dt;
+      if (p.life <= 0) { parts.splice(i, 1); continue; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 1 - 2.2 * dt; p.vy *= 1 - 2.2 * dt;
+    }
+    for (let i = rings.length - 1; i >= 0; i--) { rings[i].t += dt; if (rings[i].t > 0.6) rings.splice(i, 1); }
+    S.shake *= Math.pow(0.0015, dt);
+
+    if (S.state === 'over') return;
+
+    // countdown -> play
+    if (S.state === 'count') {
+      S.countT -= dt;
+      if (S.countT <= 0) { S.state = 'play'; S.t = 0; beep(880, 0.16, 'triangle', 0.06); }
+    }
+
+    // player movement (also allowed during the countdown)
+    const mv = 700 * dt;
+    let dir = 0;
+    if (keys.has('arrowleft') || keys.has('a')) dir -= 1;
+    if (keys.has('arrowright') || keys.has('d')) dir += 1;
+    if (dir !== 0) { player.x += dir * mv; player.targetX = null; }
+    else if (player.targetX !== null) player.x += (player.targetX - player.x) * Math.min(1, dt * 16);
+    player.x = clamp(player.x, player.w / 2 + 6, W - player.w / 2 - 6);
+    player.y = H - 92;
+
+    if (S.state !== 'play') return;
+
+    // speed ramp
+    S.speed = Math.min(3.4, 1 + S.t * 0.055);
+    S.score += dt * 12 * S.speed;
+    if (S.comboT > 0) { S.comboT -= dt; if (S.comboT <= 0) S.combo = 0; }
+
+    // spawn obstacles
+    obsT -= dt;
+    if (obsT <= 0) {
+      const w = rand(22, 62), h = rand(16, 34);
+      obstacles.push({ x: rand(w / 2 + 14, W - w / 2 - 14), y: -h - 10, w, h, vy: rand(0.85, 1.35) * (210 + S.speed * 130), rot: rand(-0.5, 0.5), rv: rand(-1.6, 1.6) });
+      obsT = Math.max(0.16, 0.62 - S.t * 0.012);
+      if (S.speed > 2.2 && Math.random() < 0.35) {
+        const w2 = rand(20, 40), h2 = rand(14, 26);
+        obstacles.push({ x: rand(w2 / 2 + 14, W - w2 / 2 - 14), y: -h2 - 10, w: w2, h: h2, vy: rand(0.9, 1.4) * (210 + S.speed * 130), rot: rand(-0.5, 0.5), rv: rand(-1.6, 1.6) });
+      }
+    }
+
+    // spawn tokens
+    tokT -= dt;
+    if (tokT <= 0) {
+      tokens.push({ x: rand(24, W - 24), y: -20, r: 11, vy: 170 + S.speed * 90, ph: rand(0, 6.28) });
+      tokT = rand(1.1, 2.0);
+    }
+
+    // obstacle motion + collision
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const o = obstacles[i];
+      o.y += o.vy * dt; o.rot += o.rv * dt;
+      if (o.y > H + 60) { obstacles.splice(i, 1); continue; }
+      if (o.y + o.h / 2 > player.y - player.h / 2 && o.y - o.h / 2 < player.y + player.h / 2) {
+        if (Math.abs(o.x - player.x) < (o.w + player.w) / 2 - 5) { die(); return; }
+      }
+    }
+
+    // tokens
+    for (let i = tokens.length - 1; i >= 0; i--) {
+      const t = tokens[i];
+      t.y += t.vy * dt; t.ph += dt * 4;
+      const cx = clamp(t.x, player.x - player.w / 2, player.x + player.w / 2);
+      const cy = clamp(t.y, player.y - player.h / 2 - 4, player.y + player.h / 2 + 4);
+      if ((t.x - cx) ** 2 + (t.y - cy) ** 2 < (t.r + 6) ** 2) {
+        tokens.splice(i, 1);
+        S.combo++; S.comboT = 1.6;
+        S.score += 30 * Math.min(5, S.combo);
+        burst(t.x, t.y, 14, AM, 200);
+        rings.push({ x: t.x, y: t.y, t: 0 });
+        S.shake = Math.min(6, S.shake + 2);
+        beep(520 + Math.min(8, S.combo) * 90, 0.09, 'triangle', 0.05);
+        continue;
+      }
+      if (t.y > H + 30) tokens.splice(i, 1);
+    }
+  }
+
+  // ---------- render ----------
+  function grid(alpha) {
+    ctx.save();
+    ctx.strokeStyle = `rgba(34,211,238,${0.055 * alpha})`;
+    ctx.lineWidth = 1;
+    const g = 46, off = (S.t * 40) % g;
+    ctx.beginPath();
+    for (let x = -g; x < W + g; x += g) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+    for (let y = -g + off; y < H + g; y += g) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawStars() {
+    for (const s of stars) {
+      ctx.globalAlpha = 0.18 + s.z * 0.55;
+      ctx.fillStyle = s.z > 0.8 ? '#bfefff' : '#6d8fc0';
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r * s.z, 0, 6.2832); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPlayer() {
+    const p = player; if (p.dead) return;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    // trail
+    const grd = ctx.createLinearGradient(0, 0, 0, 46);
+    grd.addColorStop(0, 'rgba(34,211,238,0.55)');
+    grd.addColorStop(1, 'rgba(34,211,238,0)');
+    ctx.fillStyle = grd;
+    ctx.beginPath(); ctx.moveTo(-p.w / 2 + 6, 4); ctx.lineTo(p.w / 2 - 6, 4); ctx.lineTo(p.w / 2 - 14, 46); ctx.lineTo(-p.w / 2 + 14, 46); ctx.closePath(); ctx.fill();
+
+    ctx.shadowBlur = 22; ctx.shadowColor = CY;
+    ctx.fillStyle = CY;
+    rr(-p.w / 2, -p.h / 2, p.w, p.h, 6); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#eafcff';
+    rr(-p.w / 2 + 4, -p.h / 2 + 3, p.w - 8, 3.5, 2); ctx.fill();
+    ctx.fillStyle = 'rgba(4,20,30,0.55)';
+    rr(-6, -p.h / 2 + 7, 12, 3, 1.5); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawObstacles() {
+    for (const o of obstacles) {
+      ctx.save();
+      ctx.translate(o.x, o.y); ctx.rotate(o.rot);
+      ctx.shadowBlur = 16; ctx.shadowColor = MG;
+      ctx.fillStyle = 'rgba(244,114,182,0.14)';
+      rr(-o.w / 2, -o.h / 2, o.w, o.h, 5); ctx.fill();
+      ctx.strokeStyle = MG; ctx.lineWidth = 1.6;
+      rr(-o.w / 2, -o.h / 2, o.w, o.h, 5); ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = 'rgba(255,190,220,0.45)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(-o.w / 2 + 5, -o.h / 2 + 5); ctx.lineTo(-o.w / 2 + 5, o.h / 2 - 5); ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawTokens() {
+    for (const t of tokens) {
+      const s = 1 + Math.sin(t.ph) * 0.12;
+      ctx.save(); ctx.translate(t.x, t.y); ctx.scale(s, s);
+      ctx.shadowBlur = 20; ctx.shadowColor = AM;
+      ctx.strokeStyle = AM; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, t.r, 0, 6.2832); ctx.stroke();
+      ctx.globalAlpha = 0.25; ctx.fillStyle = AM;
+      ctx.beginPath(); ctx.arc(0, 0, t.r, 0, 6.2832); ctx.fill();
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+      ctx.fillStyle = '#fff6d8';
+      ctx.beginPath(); ctx.arc(0, 0, 3.2, 0, 6.2832); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawFX() {
+    for (const r of rings) {
+      const k = r.t / 0.6;
+      ctx.globalAlpha = 1 - k;
+      ctx.strokeStyle = AM; ctx.lineWidth = 2 * (1 - k);
+      ctx.beginPath(); ctx.arc(r.x, r.y, 10 + k * 34, 0, 6.2832); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    for (const p of parts) {
+      ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function text(str, x, y, size, color, align, weight, mono) {
+    ctx.font = `${weight || 400} ${size}px ${mono ? MONO : FONT}`;
+    ctx.textAlign = align || 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = color;
+    ctx.fillText(str, x, y);
+  }
+
+  function glowText(str, x, y, size, color, align, blur) {
+    ctx.save();
+    ctx.shadowBlur = blur || 24; ctx.shadowColor = color;
+    text(str, x, y, size, color, align, 700, true);
+    ctx.restore();
+  }
+
+  function drawHUD() {
+    const sc = Math.floor(S.score);
+    text(String(sc).padStart(5, '0'), 24, 44, 30, '#dff9ff', 'left', 700, true);
+    text('SCORE', 24, 62, 10, '#3f6c8c', 'left', 600, true);
+    text('BEST ' + String(S.best).padStart(5, '0'), W - 24, 44, 13, '#5b7fa6', 'right', 600, true);
+    // speed bar
+    const bw = W - 48, k = (S.speed - 1) / 2.4;
+    ctx.fillStyle = 'rgba(34,211,238,0.12)'; ctx.fillRect(24, H - 26, bw, 3);
+    ctx.fillStyle = k > 0.75 ? MG : CY; ctx.fillRect(24, H - 26, bw * clamp(k, 0, 1), 3);
+    if (S.combo > 1) {
+      const a = clamp(S.comboT / 1.6, 0, 1);
+      ctx.globalAlpha = a;
+      glowText('x' + S.combo, W - 26, 82, 22, AM, 'right', 18);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawCount() {
+    ctx.fillStyle = 'rgba(4,5,10,0.45)'; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.textAlign = 'center';
+    glowText('HARNESS RUNNER', W / 2, H / 2 - 100, Math.min(42, W * 0.056), '#7df9ff', 'center', 34);
+    text('躲开粉色方块 · 吃金色能量球 · 连击加倍', W / 2, H / 2 - 62, 14, '#7f9dc0', 'center');
+    const n = Math.max(1, Math.ceil(S.countT));
+    const frac = S.countT - Math.floor(S.countT);
+    const pop = 1 + 0.2 * frac;
+    ctx.save();
+    ctx.translate(W / 2, H / 2 + 34);
+    ctx.scale(pop, pop);
+    ctx.globalAlpha = 0.3 + 0.7 * frac;
+    glowText(String(n), 0, 0, 104, AM, 'center', 54);
+    ctx.restore();
+    text('← →  /  A D  /  鼠标  移动', W / 2, H / 2 + 118, 13, '#4d7a9e', 'center', 500, true);
+    ctx.restore();
+  }
+
+  function drawOver() {
+    ctx.fillStyle = 'rgba(4,5,10,0.62)'; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.textAlign = 'center';
+    glowText('SYSTEM FAILURE', W / 2, H / 2 - 50, Math.min(44, W * 0.06), MG, 'center', 34);
+    text('SCORE  ' + String(Math.floor(S.score)).padStart(5, '0'), W / 2, H / 2 + 6, 20, '#e6f7ff', 'center', 700, true);
+    text('BEST  ' + String(S.best).padStart(5, '0'), W / 2, H / 2 + 36, 14, '#5b7fa6', 'center', 600, true);
+    if (S.over > 0.6) {
+      ctx.globalAlpha = 0.55 + 0.45 * Math.sin(S.over * 4);
+      text('空格 / 点击  再来一次', W / 2, H / 2 + 88, 16, CY, 'center', 700);
+    }
+    ctx.restore();
+  }
+
+  function render() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#04050a';
+    ctx.fillRect(0, 0, W, H);
+
+    const sh = S.shake;
+    if (sh > 0.2) ctx.translate(rand(-sh, sh) * 0.4, rand(-sh, sh) * 0.4);
+
+    // vignette-ish backdrop glow
+    const g = ctx.createRadialGradient(W / 2, H * 0.75, 0, W / 2, H * 0.75, Math.max(W, H) * 0.75);
+    g.addColorStop(0, 'rgba(20,50,90,0.35)');
+    g.addColorStop(1, 'rgba(4,5,10,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+    grid(S.state === 'play' ? 1.6 : 1);
+    drawStars();
+    drawObstacles();
+    drawTokens();
+    drawPlayer();
+    drawFX();
+
+    if (S.state === 'play' || S.state === 'over') drawHUD();
+    if (S.state === 'count') drawCount();
+    if (S.state === 'over') drawOver();
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function frame(now) {
+    let dt = (now - last) / 1000;
+    last = now;
+    dt = Math.min(dt, 1 / 25);
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  reset();
+  S.state = 'count'; S.countT = 3;
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
